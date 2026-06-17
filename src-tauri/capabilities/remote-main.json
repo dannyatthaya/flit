@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "remote-main",
+  "description": "Least-privilege grant for the remote music.youtube.com page: core:default only, so the injected bridge can emit events. No clipboard, no filesystem, no custom commands.",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["https://music.youtube.com/*"]
+  },
+  "permissions": [
+    "core:default"
+  ]
+}

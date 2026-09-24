@@ -1,12 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "remote-main",
-  "description": "Least-privilege grant for the remote music.youtube.com page: core:default only, so the injected bridge can emit events. No clipboard, no filesystem, no custom commands.",
+  "description": "Least-privilege grant for the remote music.youtube.com page: it may only emit events (the injected bridge reports player state and asks to toggle the popup). No listening, no window/webview APIs, no custom commands, no clipboard, no filesystem. Rust treats every event from here as untrusted.",
   "windows": ["main"],
   "remote": {
     "urls": ["https://music.youtube.com/*"]
   },
   "permissions": [
-    "core:default"
+    "core:event:allow-emit"
   ]
 }

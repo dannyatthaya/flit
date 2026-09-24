@@ -8,18 +8,20 @@ Flit wraps **music.youtube.com** in a native OS webview (via [Tauri 2](https://v
 
 ## Why Flit
 
-- **Lightweight & fast.** Uses the OS's native webview — no bundled Chromium, no Electron. The goal is for the app's own overhead (excluding the YouTube Music page) to stay in the low tens of MB, with state polling that backs off to ~1 Hz only while something is playing or a window is visible.
+- **Lightweight & fast.** Uses the OS's native webview — no bundled Chromium, no Electron. The goal is for the app's own overhead (excluding the YouTube Music page) to stay in the low tens of MB. Player state is sampled every 1 s while playing, every 2 s while paused, and every 5 s while the YouTube Music window is hidden. It is only sent when something changed, the album art and queue only when they change, and nothing is forwarded to the mini-player while it is closed.
 - **Private by design.** Zero analytics, zero telemetry, zero crash-reporting. No backend, no account system, no OAuth. The app only ever contacts **YouTube/Google** (the music page + album art) and **GitHub** (for updates). All settings stay local.
-- **Least privilege.** The remote YouTube Music origin is granted only Tauri's `core:default` — no custom commands, no clipboard, no filesystem access.
+- **Least privilege.** The remote YouTube Music origin may only emit events (`core:event:allow-emit`) — no custom commands, no window APIs, no clipboard, no filesystem access. Everything it reports is validated in Rust before it reaches the mini-player.
 
 ## Features
 
 - 🎵 YouTube Music in a native window (your login persists, isolated from your system browser)
 - 🖥️ Minimize-to-tray instead of quitting; single-instance enforcement
 - 🎛️ System-tray mini-player: play/pause, next/previous, seek, volume, queue, like/shuffle/repeat
-- 🚀 Auto-update from GitHub Releases *(in progress)*
-- ⚙️ Optional launch-at-startup
+- 🚀 Auto-update from GitHub Releases (signed, one-click restart)
+- ⚙️ Optional launch-at-startup (off by default; starts in the tray)
 - 🌍 Cross-platform: Windows and Linux (macOS kept buildable)
+
+> **Linux tray note:** most Linux tray hosts don't report clicks on the icon, so open the mini-player from the tray icon's menu (**Open widget**) or the small button Flit adds to the YouTube Music page. GNOME needs the AppIndicator extension to show the tray icon at all.
 
 ## Privacy & performance
 
@@ -50,7 +52,11 @@ bun run tauri build
 
 ## Auto-update
 
-Releases are published from GitHub Releases and verified with a [minisign](https://jedisct1.github.io/minisign/) key. Generate your signing keypair with Tauri's built-in signer:
+Release builds check `latest.json` on GitHub Releases 15 seconds after launch and then every 6 hours. When a newer version exists, Flit downloads it in the background and verifies its [minisign](https://jedisct1.github.io/minisign/) signature against the public key in `tauri.conf.json`. It then shows **Restart to update** in the mini-player, plus a notice in the YouTube Music window. Nothing is installed until you click it. You can also check manually under the mini-player's settings. Development builds never check automatically.
+
+On Linux, in-place updates work for the AppImage and .deb/.rpm bundles; other installs should update through their package source.
+
+Generate your signing keypair with Tauri's built-in signer:
 
 ```bash
 bun run tauri signer generate -w "$HOME/.tauri/flit.key"
@@ -65,7 +71,7 @@ Two paths:
 - **Full multi-OS release (recommended):** push a `vX.Y.Z` tag — `.github/workflows/publish.yml` builds Windows, Linux, and macOS, signs them with the CI secrets, and drafts a GitHub Release with the updater `latest.json`.
 - **Local (Windows) release from `.env`:** `pwsh scripts/release.ps1 -Version X.Y.Z -Publish` reads the signing key/password from a local `.env`, builds a signed installer, and drafts a release with `latest.json`. (The auto-updater only serves **published**, non-draft releases.)
 
-> **CSP:** the app ships with `app.security.csp = null` because the `main` window loads the remote YouTube Music site, whose own scripts/styles would be blocked by a strict policy. The remote origin is still confined to `core:default` (no custom commands/clipboard/filesystem), and the only trusted local surface is the popup.
+> **CSP:** Tauri's `app.security.csp` applies only to the app's own bundled pages — here, the mini-player popup — and never to the remote YouTube Music site. The popup ships with a strict policy: scripts from the bundle only, images only from the bundle, `data:` and YouTube/Google image hosts, and no network access besides Tauri IPC. The remote origin can only emit events, and the popup receives player state over an IPC channel that the remote page cannot write to.
 
 ## Roadmap
 

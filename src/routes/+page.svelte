@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { Channel, invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import IconSettings from "~icons/solar/settings-linear";
   import IconClose from "~icons/solar/close-circle-linear";
@@ -15,9 +15,11 @@
   import IconRepeatOne from "~icons/solar/repeat-one-minimalistic-bold";
   import IconQueue from "~icons/solar/playlist-bold";
   import IconVolume from "~icons/solar/volume-loud-bold";
+  import IconMuted from "~icons/solar/volume-cross-bold";
   import IconNote from "~icons/solar/music-note-bold";
 
-  type QueueItem = { title: string; artist: string; thumb: string };
+  type Repeat = "none" | "all" | "one";
+  type QueueItem = { index: number; title: string; artist: string; thumb: string; videoId: string };
   type PlayerState = {
     title: string;
     artist: string;
@@ -30,18 +32,29 @@
     playing: boolean;
     videoId: string;
     shuffle: boolean;
-    repeat: "none" | "all" | "one";
+    repeat: Repeat;
     likeStatus: "none" | "like" | "dislike";
+    volume: number | null;
+    muted: boolean;
     queue: QueueItem[];
   };
+  type UpdateStatus =
+    | { state: "idle" }
+    | { state: "checking" }
+    | { state: "upToDate" }
+    | { state: "downloading"; version: string; percent: number | null }
+    | { state: "ready"; version: string }
+    | { state: "installing"; version: string }
+    | { state: "error"; message: string };
 
+  const DEFAULT_ACCENT = "#3a3a44";
   const EMPTY: PlayerState = {
     title: "",
     artist: "",
     album: "",
     artworkUrl: "",
     artworkData: "",
-    color: "#3a3a44",
+    color: "",
     durationSec: 0,
     positionSec: 0,
     playing: false,
@@ -49,8 +62,17 @@
     shuffle: false,
     repeat: "none",
     likeStatus: "none",
+    volume: null,
+    muted: false,
     queue: [],
   };
+
+  /** Must match `POPUP_COMPACT_HEIGHT` in src-tauri/src/tray.rs. */
+  const COMPACT_H = 282;
+  const QUEUE_ROW_H = 46;
+  const MAX_QUEUE_ROWS = 8;
+  /** How long a local change (seek, toggle, volume drag) wins over incoming state. */
+  const HOLD_MS = 2000;
 
   let s = $state<PlayerState>({ ...EMPTY });
   let seeking = $state(false);
@@ -61,12 +83,21 @@
 
   let autostart = $state(false);
   let urlInput = $state("");
+  let urlError = $state("");
+  let update = $state<UpdateStatus>({ state: "idle" });
+  let updateError = $state("");
 
-  const COMPACT_H = 282;
+  // Optimistic local values, kept until the page confirms them or they expire,
+  // so the controls don't flicker back to the old value on the next update.
+  let seekHold: { value: number; until: number } | null = null;
+  let volumeHold = 0;
+  let shuffleHold: { value: boolean; until: number } | null = null;
+  let repeatHold: { value: Repeat; until: number } | null = null;
 
   const art = $derived(s.artworkData || s.artworkUrl || "");
-  const accent = $derived(s.color || "#3a3a44");
+  const accent = $derived(/^#[0-9a-f]{6}$/i.test(s.color) ? s.color : DEFAULT_ACCENT);
   const hasTrack = $derived(!!s.title);
+  const updateReady = $derived(update.state === "ready" || update.state === "installing");
 
   function fmt(sec: number): string {
     if (!isFinite(sec) || sec < 0) sec = 0;
@@ -75,40 +106,76 @@
     return `${m}:${r.toString().padStart(2, "0")}`;
   }
 
-  function targetHeight(): number {
-    if (!showQueue) return COMPACT_H;
-    const rows = Math.min(s.queue.length || 1, 8);
-    return Math.min(COMPACT_H + rows * 46 + 14, 660);
+  function applyState(next: PlayerState) {
+    const now = Date.now();
+    const merged = { ...EMPTY, ...next };
+
+    if (shuffleHold) {
+      if (merged.shuffle === shuffleHold.value || now > shuffleHold.until) shuffleHold = null;
+      else merged.shuffle = shuffleHold.value;
+    }
+    if (repeatHold) {
+      if (merged.repeat === repeatHold.value || now > repeatHold.until) repeatHold = null;
+      else merged.repeat = repeatHold.value;
+    }
+    s = merged;
+
+    if (seekHold && (Math.abs(merged.positionSec - seekHold.value) < 2 || now > seekHold.until)) {
+      seekHold = null;
+    }
+    if (!seeking && !seekHold) seekValue = merged.positionSec;
+
+    if (merged.volume != null && now > volumeHold) volume = merged.volume;
   }
 
   function control(action: string) {
     invoke("player_control", { action }).catch(() => {});
   }
   function commitSeek(v: number) {
-    invoke("player_seek", { position: v }).catch(() => {});
+    seekValue = v;
+    seekHold = { value: v, until: Date.now() + HOLD_MS };
     seeking = false;
+    invoke("player_seek", { position: v }).catch(() => {});
   }
   function setVol(v: number) {
+    volume = v;
+    volumeHold = Date.now() + HOLD_MS;
     invoke("player_volume", { volume: v }).catch(() => {});
   }
-  function jump(i: number) {
-    invoke("player_control", { action: `queue_jump_${i}` }).catch(() => {});
+  function jump(item: QueueItem) {
+    invoke("player_queue_jump", { index: item.index, videoId: item.videoId }).catch(() => {});
   }
   function toggleShuffle() {
-    s.shuffle = !s.shuffle;
+    const value = !s.shuffle;
+    s.shuffle = value;
+    shuffleHold = { value, until: Date.now() + HOLD_MS };
     control("shuffle");
   }
   function cycleRepeat() {
-    s.repeat = s.repeat === "none" ? "all" : s.repeat === "all" ? "one" : "none";
+    // YouTube Music cycles off → all → one → off.
+    const value: Repeat = s.repeat === "none" ? "all" : s.repeat === "all" ? "one" : "none";
+    s.repeat = value;
+    repeatHold = { value, until: Date.now() + HOLD_MS };
     control("repeat");
   }
   function closePopup() {
     invoke("hide_tray_popup").catch(() => {});
   }
-  function toggleQueue() {
-    showQueue = !showQueue;
-    invoke("resize_popup", { height: targetHeight() }).catch(() => {});
-  }
+
+  // Keep the window height in step with the queue, including when the queue
+  // grows or shrinks while it is open.
+  const targetHeight = $derived(
+    showQueue
+      ? Math.min(COMPACT_H + Math.min(s.queue.length || 1, MAX_QUEUE_ROWS) * QUEUE_ROW_H + 14, 660)
+      : COMPACT_H,
+  );
+  let requestedHeight = 0;
+  $effect(() => {
+    const h = targetHeight;
+    if (h === requestedHeight) return;
+    requestedHeight = h;
+    invoke("resize_popup", { height: h }).catch(() => {});
+  });
 
   function setAutostart(v: boolean) {
     autostart = v;
@@ -119,22 +186,69 @@
   function navigate() {
     const url = urlInput.trim();
     if (!url) return;
+    urlError = "";
     invoke("navigate_ytm", { url })
       .then(() => {
         urlInput = "";
         showSettings = false;
       })
-      .catch((e) => alert(`Could not open: ${e}`));
+      .catch((e) => (urlError = String(e)));
+  }
+
+  async function refreshUpdate() {
+    try {
+      update = (await invoke<UpdateStatus | null>("update_status")) ?? { state: "idle" };
+    } catch {
+      /* keep the last known status */
+    }
+  }
+  function checkForUpdates() {
+    updateError = "";
+    update = { state: "checking" };
+    invoke<UpdateStatus | null>("update_check")
+      .then((st) => (update = st ?? { state: "idle" }))
+      .catch((e) => (updateError = String(e)));
+  }
+  function installUpdate() {
+    updateError = "";
+    invoke("update_install").catch((e) => {
+      updateError = String(e);
+      refreshUpdate();
+    });
+  }
+  function updateLabel(u: UpdateStatus): string {
+    switch (u.state) {
+      case "checking":
+        return "Checking for updates…";
+      case "upToDate":
+        return "Flit is up to date";
+      case "downloading":
+        return `Downloading ${u.version}${u.percent != null ? ` (${u.percent}%)` : "…"}`;
+      case "ready":
+        return `Version ${u.version} is ready to install`;
+      case "installing":
+        return `Installing ${u.version}…`;
+      case "error":
+        return `Update check failed: ${u.message}`;
+      default:
+        return "Updates are checked automatically";
+    }
   }
 
   onMount(() => {
-    const un = listen<PlayerState>("flit-player-state", (e) => {
-      s = { ...EMPTY, ...e.payload };
-      if (!seeking) seekValue = s.positionSec;
-    });
+    const channel = new Channel<PlayerState>();
+    channel.onmessage = applyState;
+    invoke("player_subscribe", { onState: channel }).catch(() => {});
+
+    // The event only says "something changed"; the status itself is read
+    // from Rust so a spoofed event can't fake an update.
+    const unlisten = listen("flit-update-status", refreshUpdate);
+    refreshUpdate();
+
     invoke<boolean>("autostart_get").then((v) => (autostart = v)).catch(() => {});
-    if (!showQueue) invoke("resize_popup", { height: COMPACT_H }).catch(() => {});
-    return () => un.then((f) => f());
+    return () => {
+      unlisten.then((f) => f());
+    };
   });
 </script>
 
@@ -142,6 +256,11 @@
   <header data-tauri-drag-region>
     <span class="brand" data-tauri-drag-region>Flit</span>
     <div class="hbtns">
+      {#if updateReady}
+        <button class="pill" onclick={installUpdate} disabled={update.state === "installing"} title={updateLabel(update)}>
+          {update.state === "installing" ? "Installing…" : "Restart to update"}
+        </button>
+      {/if}
       <button class="icon" title="Settings" onclick={() => (showSettings = !showSettings)} aria-label="Settings"><IconSettings /></button>
       <button class="icon" title="Hide" onclick={closePopup} aria-label="Hide"><IconClose /></button>
     </div>
@@ -169,7 +288,8 @@
       max={s.durationSec || 0}
       step="1"
       value={seekValue}
-      disabled={!hasTrack}
+      disabled={!hasTrack || !s.durationSec}
+      aria-label="Seek"
       style="--fill: {s.durationSec ? Math.min(100, (seekValue / s.durationSec) * 100) : 0}%"
       oninput={(e) => {
         seeking = true;
@@ -182,7 +302,7 @@
 
   <div class="transport">
     <button class="tbtn" onclick={() => control("previous")} aria-label="Previous"><IconPrev /></button>
-    <button class="play" onclick={() => control("play_pause")} aria-label="Play/Pause">
+    <button class="play" onclick={() => control("play_pause")} aria-label={s.playing ? "Pause" : "Play"}>
       {#if s.playing}<IconPause />{:else}<IconPlay />{/if}
     </button>
     <button class="tbtn" onclick={() => control("next")} aria-label="Next"><IconNext /></button>
@@ -195,11 +315,11 @@
     <button class="sbtn" class:active={s.repeat !== "none"} onclick={cycleRepeat} aria-label="Repeat" title={s.repeat === "one" ? "Repeat one" : s.repeat === "all" ? "Repeat all" : "Repeat off"}>
       {#if s.repeat === "one"}<IconRepeatOne />{:else}<IconRepeat />{/if}
     </button>
-    <button class="sbtn" class:active={showQueue} onclick={toggleQueue} aria-label="Queue" title="Queue"><IconQueue /></button>
+    <button class="sbtn" class:active={showQueue} onclick={() => (showQueue = !showQueue)} aria-label="Queue" title="Queue"><IconQueue /></button>
   </div>
 
   <div class="volume">
-    <span class="vlabel"><IconVolume /></span>
+    <span class="vlabel">{#if s.muted}<IconMuted />{:else}<IconVolume />{/if}</span>
     <input
       class="range"
       type="range"
@@ -207,11 +327,9 @@
       max="100"
       step="1"
       value={volume}
+      aria-label="Volume"
       style="--fill: {volume}%"
-      oninput={(e) => {
-        volume = +e.currentTarget.value;
-        setVol(volume);
-      }}
+      oninput={(e) => setVol(+e.currentTarget.value)}
     />
     <span class="vval">{volume}</span>
   </div>
@@ -221,8 +339,8 @@
       {#if s.queue.length === 0}
         <div class="qempty">Queue is empty</div>
       {:else}
-        {#each s.queue as item, i}
-          <button class="qitem" onclick={() => jump(i)}>
+        {#each s.queue as item (item.index)}
+          <button class="qitem" class:current={!!item.videoId && item.videoId === s.videoId} onclick={() => jump(item)}>
             {#if item.thumb}<img src={item.thumb} alt="" />{:else}<div class="qthumb"><IconNote /></div>{/if}
             <div class="qmeta">
               <div class="qtitle">{item.title}</div>
@@ -238,19 +356,33 @@
     <div class="settings">
       <div class="srow">
         <span>Launch at startup</span>
-        <button class="toggle" class:on={autostart} onclick={() => setAutostart(!autostart)} aria-label="Toggle autostart"></button>
+        <button class="toggle" class:on={autostart} onclick={() => setAutostart(!autostart)} aria-label="Launch at startup" aria-pressed={autostart}></button>
       </div>
       <div class="srow col">
-        <span>Open YouTube Music URL</span>
+        <span>Updates</span>
+        <div class="uprow">
+          <span class="ustatus">{updateLabel(update)}</span>
+          {#if updateReady}
+            <button class="go" onclick={installUpdate} disabled={update.state === "installing"}>Restart</button>
+          {:else}
+            <button class="go" onclick={checkForUpdates} disabled={update.state === "checking" || update.state === "downloading"}>Check</button>
+          {/if}
+        </div>
+        {#if updateError}<div class="err">{updateError}</div>{/if}
+      </div>
+      <div class="srow col">
+        <span>Open YouTube Music link</span>
         <div class="urlrow">
           <input
             class="urlinput"
-            placeholder="https://music.youtube.com/..."
+            placeholder="music.youtube.com/… or youtu.be/…"
             bind:value={urlInput}
+            oninput={() => (urlError = "")}
             onkeydown={(e) => e.key === "Enter" && navigate()}
           />
           <button class="go" onclick={navigate}>Go</button>
         </div>
+        {#if urlError}<div class="err">{urlError}</div>{/if}
       </div>
       <button class="close-settings" onclick={() => (showSettings = false)}>Done</button>
     </div>
@@ -531,5 +663,21 @@
     transition: background 0.15s;
   }
   .go:hover, .close-settings:hover { background: rgba(255, 255, 255, 0.22); }
+  .go:disabled, .pill:disabled { opacity: 0.5; cursor: default; }
   .close-settings { margin-top: auto; }
+  .uprow { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+  .ustatus { font-size: 0.74rem; opacity: 0.7; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .err { font-size: 0.72rem; color: #ff8a8a; overflow-wrap: anywhere; }
+  .pill {
+    all: unset;
+    cursor: pointer;
+    font-size: 0.68rem;
+    font-weight: 600;
+    padding: 3px 9px;
+    margin-right: 4px;
+    border-radius: 999px;
+    background: #2ee6a0;
+    color: #0b0b0e;
+  }
+  .qitem.current { background: rgba(255, 255, 255, 0.1); }
 </style>

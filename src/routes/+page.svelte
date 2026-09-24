@@ -108,9 +108,18 @@
     return `${m}:${r.toString().padStart(2, "0")}`;
   }
 
-  function applyState(next: PlayerState) {
+  /** Rust leaves out `artworkData` and `queue` when they haven't changed. */
+  type PlayerMessage = Omit<PlayerState, "artworkData" | "queue"> &
+    Partial<Pick<PlayerState, "artworkData" | "queue">>;
+
+  function applyState(next: PlayerMessage) {
     const now = Date.now();
-    const merged = { ...EMPTY, ...next };
+    const merged: PlayerState = {
+      ...EMPTY,
+      ...next,
+      artworkData: next.artworkData ?? s.artworkData,
+      queue: next.queue ?? s.queue,
+    };
 
     if (shuffleHold) {
       if (merged.shuffle === shuffleHold.value || now > shuffleHold.until) shuffleHold = null;
@@ -243,7 +252,7 @@
   }
 
   onMount(() => {
-    const channel = new Channel<PlayerState>();
+    const channel = new Channel<PlayerMessage>();
     channel.onmessage = applyState;
     invoke("player_subscribe", { onState: channel }).catch(() => {});
 

@@ -3,6 +3,26 @@ pub const INJECT_JS: &str = r#"
   try { if (window.top !== window.self) return; } catch (e) { return; }
   if (window.__flit__ && window.__flit__.__ready) return;
 
+  // New windows open in the system browser (see src/external.rs). Only allow
+  // them right after a real click, so a script on the page can't pop browser
+  // tabs by itself (Linux/macOS webviews already block this; WebView2 doesn't).
+  (function () {
+    var activation = navigator.userActivation;
+    var nativeOpen = window.open;
+    if (typeof nativeOpen === 'function' && activation) {
+      window.open = function () {
+        if (!activation.isActive) return null;
+        return nativeOpen.apply(this, arguments);
+      };
+    }
+    document.addEventListener('click', function (e) {
+      if (e.isTrusted) return;
+      var a = e.target && e.target.closest && e.target.closest('a[target]');
+      var target = a && (a.getAttribute('target') || '').toLowerCase();
+      if (target && target !== '_self' && target !== '_top' && target !== '_parent') e.preventDefault();
+    }, true);
+  })();
+
   // Off YouTube Music (Google sign-in, consent pages, a link that navigated
   // the window away) the app has no address bar, so offer a way back.
   if (location.hostname !== 'music.youtube.com') {
@@ -403,21 +423,35 @@ pub const INJECT_JS: &str = r#"
     };
   }
 
-  // Rust reports whether the window is on screen; `document.hidden` is not
-  // reliable for a window Tauri hides or minimizes.
-  var windowVisible = true;
+  // Rust reports whether the window is on screen (`document.hidden` is not
+  // reliable for a window Tauri hides or minimizes) and whether the popup is
+  // open. Either one being visible means someone is watching the state.
+  var windowVisible = true, popupVisible = false;
+  function watched() { return popupVisible || (windowVisible && !document.hidden); }
+  function refreshNow() {
+    if (!timer) return;
+    clearTimeout(timer);
+    tick();
+  }
   function setWindowVisible(visible) {
-    var wasVisible = windowVisible;
+    var was = watched();
     windowVisible = !!visible;
-    if (windowVisible && !wasVisible && timer) {
-      // Refresh right away instead of waiting out the slow hidden interval.
-      clearTimeout(timer);
-      tick();
-    }
+    if (watched() && !was) refreshNow();
+  }
+  function setPopupVisible(visible) {
+    var was = popupVisible;
+    popupVisible = !!visible;
+    if (popupVisible && !was) refreshNow();
   }
 
-  var timer = null;
+  var timer = null, lastSampleAt = 0;
   function tick() {
+    sample();
+    scheduleNext();
+  }
+  // Read the player and report it if anything changed.
+  function sample() {
+    lastSampleAt = Date.now();
     try {
       var state = buildState();
       var artReady = state.__artReady;
@@ -440,12 +474,27 @@ pub const INJECT_JS: &str = r#"
         lastEmitAt = now;
       }
     } catch (e) {}
-    scheduleNext();
   }
   function scheduleNext() {
-    var delay = (document.hidden || !windowVisible) ? 5000 : (isPlaying() ? 1000 : 2000);
+    var delay = watched() ? (isPlaying() ? 1000 : 2000) : 5000;
     timer = setTimeout(tick, delay);
   }
+
+  // Timers in a hidden page can be throttled to about once a minute, so also
+  // report straight from the video's own events: play/pause, seeks, track
+  // loads and volume changes at once, playback progress about once a second.
+  // Media events don't bubble, but a capturing listener still sees them.
+  var sampleQueued = false;
+  function sampleSoon() {
+    if (sampleQueued) return;
+    sampleQueued = true;
+    Promise.resolve().then(function () { sampleQueued = false; sample(); });
+  }
+  ['play', 'pause', 'ended', 'seeked', 'loadedmetadata', 'durationchange', 'volumechange', 'emptied']
+    .forEach(function (type) { document.addEventListener(type, sampleSoon, true); });
+  document.addEventListener('timeupdate', function () {
+    if (watched() && Date.now() - lastSampleAt >= 900) sampleSoon();
+  }, true);
 
   var STYLE =
     '#flit-strip{position:fixed;right:16px;bottom:84px;z-index:2147483646;display:flex;' +
@@ -509,6 +558,7 @@ pub const INJECT_JS: &str = r#"
   window.__flit__.__ready = true;
   window.__flit__.showUpdateNotif = showUpdateNotif;
   window.__flit__.setWindowVisible = setWindowVisible;
+  window.__flit__.setPopupVisible = setPopupVisible;
 
   var started = false;
   function start() {

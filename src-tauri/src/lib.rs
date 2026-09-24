@@ -12,6 +12,7 @@ use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{Listener, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 const YTM_URL: &str = "https://music.youtube.com";
+const YTM_HOST: &str = "music.youtube.com";
 
 /// Passed by the launch-at-startup entry so login starts Flit in the tray.
 const MINIMIZED_ARG: &str = "--minimized";
@@ -121,12 +122,16 @@ pub fn run() {
                 let _ = url;
                 NewWindowResponse::Deny
             })
-            // The page can't reliably tell when Tauri hides its window, so
-            // tell the bridge after every load (it polls less when hidden).
-            .on_page_load(|window, payload| {
-                if payload.event() == PageLoadEvent::Finished {
-                    tray::sync_main_visibility(&window, true);
+            .on_page_load(|window, payload| match payload.event() {
+                // Leaving YouTube Music (sign-in, a link that navigated away)
+                // stops playback; don't keep showing the old track as playing.
+                PageLoadEvent::Started if payload.url().host_str() != Some(YTM_HOST) => {
+                    window.state::<player::PlayerHub>().reset();
                 }
+                // The page can't reliably tell when Tauri hides its window or
+                // opens the popup, so tell the new bridge after every load.
+                PageLoadEvent::Finished => tray::sync_bridge(&window),
+                _ => {}
             })
             .build()?;
 

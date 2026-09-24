@@ -138,6 +138,12 @@ pub async fn update_install<R: Runtime>(app: AppHandle<R>) -> Result<(), String>
         .map_err(|e| e.to_string())?
 }
 
+/// Keep the popup open when it loses focus (the pin button in its header).
+#[tauri::command]
+pub fn popup_set_pinned(pinned: bool) {
+    crate::tray::set_popup_pinned(pinned);
+}
+
 #[tauri::command]
 pub fn navigate_ytm<R: Runtime>(app: AppHandle<R>, url: String) -> Result<(), String> {
     let target = normalize_ytm_url(&url)?;
@@ -168,8 +174,23 @@ pub fn normalize_ytm_url(input: &str) -> Result<Url, String> {
     let mut out = Url::parse("https://music.youtube.com/").expect("valid base URL");
     match host.as_str() {
         "music.youtube.com" | "youtube.com" | "www.youtube.com" | "m.youtube.com" => {
-            out.set_path(parsed.path());
-            out.set_query(parsed.query());
+            // Shorts, embed and live links have no page on YouTube Music;
+            // play the video through the watch page instead.
+            let video_path = ["/shorts/", "/embed/", "/live/"]
+                .iter()
+                .find_map(|prefix| parsed.path().strip_prefix(prefix))
+                .map(|rest| clean_video_id(rest.split('/').next().unwrap_or("")))
+                .filter(|id| !id.is_empty());
+            match video_path {
+                Some(id) => {
+                    out.set_path("/watch");
+                    out.query_pairs_mut().append_pair("v", &id);
+                }
+                None => {
+                    out.set_path(parsed.path());
+                    out.set_query(parsed.query());
+                }
+            }
         }
         "youtu.be" => {
             let id = clean_video_id(parsed.path().trim_start_matches('/'));
@@ -216,6 +237,27 @@ mod tests {
         assert_eq!(
             n("http://user:pw@music.youtube.com:8443/playlist?list=PL1").unwrap(),
             "https://music.youtube.com/playlist?list=PL1"
+        );
+    }
+
+    #[test]
+    fn maps_video_only_paths_to_watch() {
+        assert_eq!(
+            n("https://www.youtube.com/shorts/abc123?feature=share").unwrap(),
+            "https://music.youtube.com/watch?v=abc123"
+        );
+        assert_eq!(
+            n("youtube.com/embed/abc123").unwrap(),
+            "https://music.youtube.com/watch?v=abc123"
+        );
+        assert_eq!(
+            n("https://youtube.com/live/abc123/").unwrap(),
+            "https://music.youtube.com/watch?v=abc123"
+        );
+        // An unusable id keeps the original path.
+        assert_eq!(
+            n("https://youtube.com/shorts/").unwrap(),
+            "https://music.youtube.com/shorts/"
         );
     }
 

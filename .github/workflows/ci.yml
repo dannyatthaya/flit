@@ -1,0 +1,80 @@
+name: CI
+
+# Lint, type-check, build and test on every pull request and on main.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Type-check frontend
+        run: bun run check
+
+      # Also produces ../build, which the Rust crate embeds at compile time.
+      - name: Build frontend
+        run: bun run build
+
+      - name: Rust format
+        if: runner.os == 'Linux'
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      # The Windows-only `wry` dependency must match the version Tauri uses,
+      # or the app silently compiles two copies of it.
+      - name: Single wry version
+        if: runner.os == 'Linux'
+        working-directory: src-tauri
+        run: |
+          versions=$(cargo tree --target all -e normal --prefix none | sed -n 's/^wry v\([^ ]*\).*/\1/p' | sort -u)
+          echo "wry versions: $versions"
+          test "$(echo "$versions" | wc -l)" -eq 1

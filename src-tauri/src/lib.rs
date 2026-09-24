@@ -1,9 +1,14 @@
 mod commands;
+#[cfg(desktop)]
+mod external;
 mod inject;
 mod player;
 mod tray;
 mod updater;
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{Listener, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 const YTM_URL: &str = "https://music.youtube.com";
@@ -11,14 +16,23 @@ const YTM_URL: &str = "https://music.youtube.com";
 /// Passed by the launch-at-startup entry so login starts Flit in the tray.
 const MINIMIZED_ARG: &str = "--minimized";
 
-/// Chrome major version advertised on macOS/Linux, where the webview is WebKit
-/// and has no Chromium version of its own. Bump it now and then so YouTube
-/// Music doesn't treat the app as an outdated browser.
-const FALLBACK_CHROME_MAJOR: u32 = 140;
+/// Chrome 140 reached stable on 2025-09-02 (UTC); Chrome ships a new major
+/// version every four weeks.
+const CHROME_ANCHOR_MAJOR: u32 = 140;
+const CHROME_ANCHOR_UNIX: u64 = 1_756_771_200;
+const CHROME_RELEASE_SECS: u64 = 28 * 24 * 60 * 60;
+
+/// The Chrome major version that is current around `unix_secs`, estimated from
+/// Chrome's release cadence. Capped so a wildly wrong clock can't produce an
+/// absurd version.
+fn estimated_chrome_major(unix_secs: u64) -> u32 {
+    let releases = unix_secs.saturating_sub(CHROME_ANCHOR_UNIX) / CHROME_RELEASE_SECS;
+    CHROME_ANCHOR_MAJOR + releases.min(130) as u32
+}
 
 fn chrome_major() -> u32 {
     // On Windows the webview *is* Chromium (WebView2, kept up to date by the
-    // OS), so advertise its real version instead of a hard-coded one.
+    // OS), so advertise its real version.
     #[cfg(windows)]
     if let Some(major) = wry::webview_version()
         .ok()
@@ -26,7 +40,13 @@ fn chrome_major() -> u32 {
     {
         return major;
     }
-    FALLBACK_CHROME_MAJOR
+    // macOS/Linux use WebKit, which has no Chromium version; estimate the
+    // current one so YouTube Music never sees an outdated browser.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(CHROME_ANCHOR_UNIX);
+    estimated_chrome_major(now)
 }
 
 fn user_agent() -> String {
@@ -76,6 +96,7 @@ pub fn run() {
             commands::update_check,
             commands::update_install,
             commands::navigate_ytm,
+            commands::popup_set_pinned,
         ])
         .setup(|app| {
             let handle = app.handle();
@@ -92,15 +113,34 @@ pub fn run() {
             .visible(!start_minimized)
             .user_agent(&user_agent())
             .initialization_script(inject::INJECT_JS)
+            // Links that ask for a new window (target="_blank", window.open)
+            // open in the system browser; the app never spawns extra windows.
+            .on_new_window(|url, _features| {
+                #[cfg(desktop)]
+                external::open_in_browser(&url);
+                let _ = url;
+                NewWindowResponse::Deny
+            })
+            // The page can't reliably tell when Tauri hides its window, so
+            // tell the bridge after every load (it polls less when hidden).
+            .on_page_load(|window, payload| {
+                if payload.event() == PageLoadEvent::Finished {
+                    tray::sync_main_visibility(&window, true);
+                }
+            })
             .build()?;
 
             {
+                let h = handle.clone();
                 let w = main_window.clone();
-                main_window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
+                main_window.on_window_event(move |event| match event {
+                    WindowEvent::CloseRequested { api, .. } => {
                         api.prevent_close();
-                        let _ = w.hide();
+                        tray::hide_main_window(&h);
                     }
+                    // Minimizing/restoring arrives as a resize.
+                    WindowEvent::Resized(_) => tray::sync_main_visibility(&w, false),
+                    _ => {}
                 });
             }
 
@@ -144,12 +184,22 @@ pub fn run() {
                 });
             }
             {
+                // Rate-limited so a script on the page can't make the popup
+                // flash open and shut.
                 let h = handle.clone();
+                let last = Mutex::new(None::<Instant>);
                 handle.listen("flit-toggle-popup", move |_event| {
+                    let Ok(mut last) = last.lock() else { return };
+                    if last.is_some_and(|t| t.elapsed() < Duration::from_millis(500)) {
+                        return;
+                    }
+                    *last = Some(Instant::now());
+                    drop(last);
                     tray::toggle_popup(&h, None);
                 });
             }
 
+            refresh_autostart_entry(handle);
             updater::spawn_background_checks(handle);
 
             Ok(())
@@ -164,4 +214,37 @@ pub fn run() {
             tray::show_main_window(_app);
         }
     });
+}
+
+/// Launch-at-startup entries written by older versions have no
+/// `--minimized` argument (and 0.1.0 enabled the entry without asking), so
+/// rewrite an existing entry with the current arguments. Never creates one.
+fn refresh_autostart_entry<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    #[cfg(desktop)]
+    if !cfg!(debug_assertions) {
+        use tauri_plugin_autostart::ManagerExt;
+        let launcher = app.autolaunch();
+        if launcher.is_enabled().unwrap_or(false) {
+            let _ = launcher.enable();
+        }
+    }
+    #[cfg(not(desktop))]
+    let _ = app;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chrome_version_estimate_follows_release_cadence() {
+        assert_eq!(estimated_chrome_major(0), CHROME_ANCHOR_MAJOR);
+        assert_eq!(estimated_chrome_major(CHROME_ANCHOR_UNIX), 140);
+        // 2026-09-24 is 387 days after the anchor: 13 four-week releases.
+        assert_eq!(
+            estimated_chrome_major(CHROME_ANCHOR_UNIX + 387 * 86_400),
+            153
+        );
+        assert_eq!(estimated_chrome_major(u64::MAX), 270);
+    }
 }

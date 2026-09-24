@@ -23,6 +23,10 @@
   commit) and upload the Windows installer, its signature, and latest.json.
   Requires the `gh` CLI, a clean working tree, and the commit pushed.
 
+  The generated latest.json only lists Windows. Once published, Windows users
+  update to it; Linux and macOS installs see no build for their platform and
+  stay on their version until a full release from CI.
+
 .EXAMPLE
   pwsh scripts/release.ps1 -Version 0.2.0   # bump + test build; then commit & push
   pwsh scripts/release.ps1 -Publish         # build the committed version and draft the release
@@ -112,6 +116,9 @@ if ($Publish) {
     if ($LASTEXITCODE -ne 0) { throw 'git status failed' }
     if ($dirty) { throw "Working tree is not clean; commit or stash first:`n$dirty" }
     $commit = (git rev-parse HEAD).Trim()
+    # Refresh remote-tracking refs so a commit pushed from elsewhere counts.
+    git fetch --quiet origin
+    if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
     $remoteBranches = git branch -r --contains $commit
     if (-not $remoteBranches) { throw "Commit $commit is not pushed; push it before publishing." }
     # A missing release makes `gh` write to stderr; don't let that stop the script.

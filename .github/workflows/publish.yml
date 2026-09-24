@@ -1,6 +1,8 @@
 name: Publish
 
 # Build, sign, and draft a GitHub Release (with updater latest.json) on v* tags.
+# A manual run must be started from a v* tag (the "Use workflow from" picker);
+# on a branch the job is skipped so it can never create a release named after it.
 on:
   push:
     tags:
@@ -9,6 +11,7 @@ on:
 
 jobs:
   publish-tauri:
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     strategy:
@@ -54,7 +57,7 @@ jobs:
             libssl-dev
 
       - name: Install frontend dependencies
-        run: bun install
+        run: bun install --frozen-lockfile
 
       - name: Build, sign, and release
         uses: tauri-apps/tauri-action@v0

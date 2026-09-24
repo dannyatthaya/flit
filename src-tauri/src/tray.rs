@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::{
@@ -25,6 +25,10 @@ const EDGE_MARGIN: f64 = 8.0;
 const BLUR_REOPEN_GUARD: Duration = Duration::from_millis(350);
 
 static RESIZE_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// While pinned, the popup stays open when it loses focus.
+static POPUP_PINNED: AtomicBool = AtomicBool::new(false);
+/// Last visibility sent to the page bridge: 0 = none yet, 1 = visible, 2 = hidden.
+static MAIN_VISIBILITY_SENT: AtomicU8 = AtomicU8::new(0);
 static LAST_BLUR_HIDE: Mutex<Option<Instant>> = Mutex::new(None);
 
 pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
@@ -104,11 +108,17 @@ pub fn hide_popup<R: Runtime>(app: &AppHandle<R>) {
 /// Called when the popup reports it lost focus. Focus can flicker between the
 /// window and its webview, so re-check after a short delay before hiding.
 pub fn popup_blurred<R: Runtime>(app: &AppHandle<R>) {
+    if POPUP_PINNED.load(Ordering::Relaxed) {
+        return;
+    }
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(120));
         let Some(win) = popup(&app) else { return };
-        if win.is_visible().unwrap_or(false) && !win.is_focused().unwrap_or(true) {
+        let still_blurred = win.is_visible().unwrap_or(false)
+            && !win.is_focused().unwrap_or(true)
+            && !POPUP_PINNED.load(Ordering::Relaxed);
+        if still_blurred {
             if let Ok(mut t) = LAST_BLUR_HIDE.lock() {
                 *t = Some(Instant::now());
             }
@@ -150,12 +160,42 @@ fn strip_dwm_border<R: Runtime>(win: &WebviewWindow<R>) {
 #[cfg(not(windows))]
 fn strip_dwm_border<R: Runtime>(_win: &WebviewWindow<R>) {}
 
+pub fn set_popup_pinned(pinned: bool) {
+    POPUP_PINNED.store(pinned, Ordering::Relaxed);
+}
+
 pub fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(win) = app.get_webview_window(MAIN_LABEL) {
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
+        send_main_visibility(&win, true, false);
     }
+}
+
+pub fn hide_main_window<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(win) = app.get_webview_window(MAIN_LABEL) {
+        let _ = win.hide();
+        send_main_visibility(&win, false, false);
+    }
+}
+
+/// Tell the page bridge whether its window is on screen (hidden or minimized
+/// windows don't reliably set `document.hidden` in every webview). `force`
+/// resends an unchanged value, which a freshly loaded page needs.
+pub fn sync_main_visibility<R: Runtime>(win: &WebviewWindow<R>, force: bool) {
+    let visible = win.is_visible().unwrap_or(true) && !win.is_minimized().unwrap_or(false);
+    send_main_visibility(win, visible, force);
+}
+
+fn send_main_visibility<R: Runtime>(win: &WebviewWindow<R>, visible: bool, force: bool) {
+    let code = if visible { 1 } else { 2 };
+    if MAIN_VISIBILITY_SENT.swap(code, Ordering::Relaxed) == code && !force {
+        return;
+    }
+    let _ = win.eval(format!(
+        "window.__flit__&&window.__flit__.setWindowVisible&&window.__flit__.setWindowVisible({visible})"
+    ));
 }
 
 /// Work area (screen minus taskbar/menu bar) of a monitor, in physical pixels:
@@ -243,14 +283,14 @@ pub fn animate_resize<R: Runtime>(win: WebviewWindow<R>, target_h: f64) {
     let (top_y, bottom_y) = (pos.y as f64, pos.y as f64 + outer.height as f64);
     let grow_up = area.is_some_and(|(_, t, _, b)| (top_y + bottom_y) / 2.0 > (t + b) / 2.0);
 
+    let outer_w = outer.width as f64;
     let apply = move |h: f64| {
         let outer_h = h * scale + chrome_h;
         let mut y = if grow_up { bottom_y - outer_h } else { top_y };
         if let Some((_, t, _, b)) = area {
             y = clamp_axis(y, t, b, outer_h);
         }
-        let _ = win.set_position(PhysicalPosition::new(pos.x as f64, y));
-        let _ = win.set_size(LogicalSize::new(POPUP_WIDTH, h));
+        set_bounds(&win, (pos.x as f64, y), (outer_w, outer_h), h);
     };
 
     std::thread::spawn(move || {
@@ -264,4 +304,49 @@ pub fn animate_resize<R: Runtime>(win: WebviewWindow<R>, target_h: f64) {
             std::thread::sleep(Duration::from_millis(RESIZE_MS / RESIZE_STEPS as u64));
         }
     });
+}
+
+/// Move and resize the popup. `outer` is the physical outer size; `logical_h`
+/// the logical inner height used by the portable fallback.
+#[cfg(windows)]
+fn set_bounds<R: Runtime>(
+    win: &WebviewWindow<R>,
+    pos: (f64, f64),
+    outer: (f64, f64),
+    logical_h: f64,
+) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+    if let Ok(hwnd) = win.hwnd() {
+        // One call moves and resizes together, so the edge next to the tray
+        // doesn't jump for a frame while the popup grows upward.
+        // SAFETY: `hwnd` is the popup's live window handle; a null
+        // insert-after handle is ignored because of SWP_NOZORDER.
+        let ok = unsafe {
+            SetWindowPos(
+                hwnd.0 as _,
+                std::ptr::null_mut(),
+                pos.0.round() as i32,
+                pos.1.round() as i32,
+                outer.0.round() as i32,
+                outer.1.round() as i32,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+        if ok != 0 {
+            return;
+        }
+    }
+    let _ = win.set_position(PhysicalPosition::new(pos.0, pos.1));
+    let _ = win.set_size(LogicalSize::new(POPUP_WIDTH, logical_h));
+}
+
+#[cfg(not(windows))]
+fn set_bounds<R: Runtime>(
+    win: &WebviewWindow<R>,
+    pos: (f64, f64),
+    _outer: (f64, f64),
+    logical_h: f64,
+) {
+    let _ = win.set_position(PhysicalPosition::new(pos.0, pos.1));
+    let _ = win.set_size(LogicalSize::new(POPUP_WIDTH, logical_h));
 }

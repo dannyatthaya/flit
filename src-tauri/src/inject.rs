@@ -3,6 +3,30 @@ pub const INJECT_JS: &str = r#"
   try { if (window.top !== window.self) return; } catch (e) { return; }
   if (window.__flit__ && window.__flit__.__ready) return;
 
+  // Off YouTube Music (Google sign-in, consent pages, a link that navigated
+  // the window away) the app has no address bar, so offer a way back.
+  if (location.hostname !== 'music.youtube.com') {
+    var addBackButton = function () {
+      if (!document.body || document.getElementById('flit-back')) return;
+      var back = document.createElement('button');
+      back.id = 'flit-back';
+      back.type = 'button';
+      back.textContent = '\u2190 YouTube Music';
+      // CSSOM styles, not a <style> tag, so strict page CSPs can't block them.
+      Object.assign(back.style, {
+        position: 'fixed', left: '16px', bottom: '16px', zIndex: '2147483647',
+        padding: '8px 14px', border: '1px solid rgba(255,255,255,.18)', borderRadius: '999px',
+        background: 'rgba(20,20,24,.9)', color: '#fff', font: '13px system-ui,sans-serif',
+        cursor: 'pointer', boxShadow: '0 6px 24px rgba(0,0,0,.35)'
+      });
+      back.addEventListener('click', function () { location.href = 'https://music.youtube.com/'; });
+      document.body.appendChild(back);
+    };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', addBackButton);
+    else addBackButton();
+    return;
+  }
+
   function emit(event, payload) {
     try {
       var t = window.__TAURI_INTERNALS__;
@@ -379,6 +403,19 @@ pub const INJECT_JS: &str = r#"
     };
   }
 
+  // Rust reports whether the window is on screen; `document.hidden` is not
+  // reliable for a window Tauri hides or minimizes.
+  var windowVisible = true;
+  function setWindowVisible(visible) {
+    var wasVisible = windowVisible;
+    windowVisible = !!visible;
+    if (windowVisible && !wasVisible && timer) {
+      // Refresh right away instead of waiting out the slow hidden interval.
+      clearTimeout(timer);
+      tick();
+    }
+  }
+
   var timer = null;
   function tick() {
     try {
@@ -406,7 +443,7 @@ pub const INJECT_JS: &str = r#"
     scheduleNext();
   }
   function scheduleNext() {
-    var delay = document.hidden ? 5000 : (isPlaying() ? 1000 : 2000);
+    var delay = (document.hidden || !windowVisible) ? 5000 : (isPlaying() ? 1000 : 2000);
     timer = setTimeout(tick, delay);
   }
 
@@ -471,9 +508,12 @@ pub const INJECT_JS: &str = r#"
   window.__flit__ = controls;
   window.__flit__.__ready = true;
   window.__flit__.showUpdateNotif = showUpdateNotif;
+  window.__flit__.setWindowVisible = setWindowVisible;
 
+  var started = false;
   function start() {
-    if (timer) return;
+    if (started) return;
+    started = true;
     try { injectStrip(); } catch (e) {}
     scheduleNext();
     try {

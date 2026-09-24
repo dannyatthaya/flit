@@ -16,7 +16,8 @@ Flit wraps **music.youtube.com** in a native OS webview (via [Tauri 2](https://v
 
 - 🎵 YouTube Music in a native window (your login persists, isolated from your system browser)
 - 🖥️ Minimize-to-tray instead of quitting; single-instance enforcement
-- 🎛️ System-tray mini-player: play/pause, next/previous, seek, volume, queue, like/shuffle/repeat
+- 🎛️ System-tray mini-player: play/pause, next/previous, seek, volume, queue, like/shuffle/repeat. It hides when you click elsewhere; pin it to keep it open
+- 🔗 Links that open a new tab (help pages, artist sites) open in your default browser; if the window ever leaves YouTube Music (for example during Google sign-in), a **← YouTube Music** button takes you back
 - 🚀 Auto-update from GitHub Releases (signed, one-click restart)
 - ⚙️ Optional launch-at-startup (off by default; starts in the tray)
 - 🌍 Cross-platform: Windows and Linux (macOS kept buildable)
@@ -50,6 +51,13 @@ bun run tauri dev
 bun run tauri build
 ```
 
+**Checks** (the same ones CI runs on every pull request):
+
+```bash
+bun run check && bun run build
+cd src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+```
+
 ## Auto-update
 
 Release builds check `latest.json` on GitHub Releases 15 seconds after launch and then every 6 hours. When a newer version exists, Flit downloads it in the background and verifies its [minisign](https://jedisct1.github.io/minisign/) signature against the public key in `tauri.conf.json`. It then shows **Restart to update** in the mini-player, plus a notice in the YouTube Music window. Nothing is installed until you click it. You can also check manually under the mini-player's settings. Development builds never check automatically.
@@ -69,7 +77,7 @@ Put the **public** key in `tauri.conf.json` (`plugins.updater.pubkey`) and keep 
 Two paths:
 
 - **Full multi-OS release (recommended):** push a `vX.Y.Z` tag — `.github/workflows/publish.yml` builds Windows, Linux, and macOS, signs them with the CI secrets, and drafts a GitHub Release with the updater `latest.json`.
-- **Local (Windows) release from `.env`:** `pwsh scripts/release.ps1 -Version X.Y.Z -Publish` reads the signing key/password from a local `.env`, builds a signed installer, and drafts a release with `latest.json`. (The auto-updater only serves **published**, non-draft releases.)
+- **Local (Windows) release from `.env`:** `pwsh scripts/release.ps1 -Version X.Y.Z -Publish` reads the signing key/password from a local `.env`, builds a signed installer, and drafts a release with `latest.json`. (The auto-updater only serves **published**, non-draft releases.) Its `latest.json` lists Windows only, so once it's published, Linux and macOS installs find no build for their platform and stay on their current version until the next full release from CI.
 
 > **CSP:** Tauri's `app.security.csp` applies only to the app's own bundled pages — here, the mini-player popup — and never to the remote YouTube Music site. The popup ships with a strict policy: scripts from the bundle only, images only from the bundle, `data:` and YouTube/Google image hosts, and no network access besides Tauri IPC. The remote origin can only emit events, and the popup receives player state over an IPC channel that the remote page cannot write to.
 

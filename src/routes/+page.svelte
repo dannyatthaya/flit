@@ -3,6 +3,8 @@
   import { Channel, invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import IconSettings from "~icons/solar/settings-linear";
+  import IconPin from "~icons/solar/pin-linear";
+  import IconPinned from "~icons/solar/pin-bold";
   import IconClose from "~icons/solar/close-circle-linear";
   import IconPrev from "~icons/solar/skip-previous-bold";
   import IconNext from "~icons/solar/skip-next-bold";
@@ -158,6 +160,11 @@
     repeatHold = { value, until: Date.now() + HOLD_MS };
     control("repeat");
   }
+  let pinned = $state(false);
+  function togglePin() {
+    pinned = !pinned;
+    invoke("popup_set_pinned", { pinned }).catch(() => (pinned = !pinned));
+  }
   function closePopup() {
     invoke("hide_tray_popup").catch(() => {});
   }
@@ -261,6 +268,7 @@
           {update.state === "installing" ? "Installing…" : "Restart to update"}
         </button>
       {/if}
+      <button class="icon" class:on={pinned} title={pinned ? "Unpin (hide when clicking elsewhere)" : "Pin (keep open)"} onclick={togglePin} aria-label="Keep open" aria-pressed={pinned}>{#if pinned}<IconPinned />{:else}<IconPin />{/if}</button>
       <button class="icon" title="Settings" onclick={() => (showSettings = !showSettings)} aria-label="Settings"><IconSettings /></button>
       <button class="icon" title="Hide" onclick={closePopup} aria-label="Hide"><IconClose /></button>
     </div>
@@ -447,6 +455,7 @@
     transition: background 0.15s, opacity 0.15s;
   }
   .icon:hover { background: rgba(255, 255, 255, 0.12); opacity: 1; }
+  .icon.on { opacity: 1; }
 
   .hero {
     display: flex;

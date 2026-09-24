@@ -1,6 +1,6 @@
 [package]
 name = "flit"
-version = "0.1.0"
+version = "0.2.0"
 description = "A fast, private YouTube Music desktop client"
 authors = ["Flit"]
 edition = "2021"
@@ -21,17 +21,20 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
 
 # Desktop-only plugins (Flit targets Windows/Linux/macOS, not mobile).
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-autostart = "2"
+# Opens links from the page in the system browser (see src/external.rs).
+open = "5"
 
 # Windows-only: remove the DWM hairline border on the borderless popup while
 # keeping the window shadow.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }
 # Read the installed WebView2 (Chromium) version for an accurate user agent.
 # Keep the version in step with the one tauri-runtime-wry uses (see Cargo.lock).
 wry = { version = "0.55", default-features = false, features = ["os-webview"] }

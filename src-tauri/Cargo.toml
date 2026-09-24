@@ -1,6 +1,6 @@
 [package]
 name = "flit"
-version = "0.2.0"
+version = "0.2.1"
 description = "A fast, private YouTube Music desktop client"
 authors = ["Flit"]
 edition = "2021"

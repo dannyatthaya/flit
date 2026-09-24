@@ -2,7 +2,9 @@
 
 The publish workflow copies the section for the tag being released into the GitHub release notes.
 
-## Unreleased
+## 0.2.1
+
+> **From 0.2.0:** click **Restart to update** in the mini-player when it appears. From 0.2.1 on, the mini-player shows **Update to …** instead, and the update is downloaded when you click it.
 
 ### Improved
 

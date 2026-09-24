@@ -76,6 +76,8 @@ Put the **public** key in `tauri.conf.json` (`plugins.updater.pubkey`) and keep 
 
 Two paths:
 
+Before tagging, add a `## X.Y.Z` section to `CHANGELOG.md`: CI uses it as the release notes (and the updater shows them).
+
 - **Full multi-OS release (recommended):** push a `vX.Y.Z` tag — `.github/workflows/publish.yml` builds Windows, Linux, and macOS, signs them with the CI secrets, and drafts a GitHub Release with the updater `latest.json`.
 - **Local (Windows) release from `.env`:** `pwsh scripts/release.ps1 -Version X.Y.Z -Publish` reads the signing key/password from a local `.env`, builds a signed installer, and drafts a release with `latest.json`. (The auto-updater only serves **published**, non-draft releases.) Its `latest.json` lists Windows only, so once it's published, Linux and macOS installs find no build for their platform and stay on their current version until the next full release from CI.
 

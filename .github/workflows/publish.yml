@@ -59,6 +59,27 @@ jobs:
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
 
+      # The release notes (and the updater's latest.json notes) come from this
+      # version's section of CHANGELOG.md.
+      - name: Release notes
+        id: notes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          notes=$(awk -v heading="## ${version}" '
+            $0 == heading { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md)
+          if [ -z "$(echo "$notes" | tr -d '[:space:]')" ]; then
+            notes="Flit ${GITHUB_REF_NAME}"
+          fi
+          {
+            echo "body<<__FLIT_NOTES__"
+            echo "$notes"
+            echo "__FLIT_NOTES__"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build, sign, and release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -69,6 +90,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Flit ${{ github.ref_name }}"
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true

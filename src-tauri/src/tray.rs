@@ -96,6 +96,7 @@ pub fn toggle_popup<R: Runtime>(app: &AppHandle<R>, anchor: Option<PhysicalPosit
     let _ = win.set_focus();
     strip_dwm_border(&win);
     app.state::<PlayerHub>().set_popup_visible(true);
+    send_popup_visibility(app, true);
 }
 
 pub fn hide_popup<R: Runtime>(app: &AppHandle<R>) {
@@ -103,6 +104,21 @@ pub fn hide_popup<R: Runtime>(app: &AppHandle<R>) {
         let _ = win.hide();
     }
     app.state::<PlayerHub>().set_popup_visible(false);
+    send_popup_visibility(app, false);
+}
+
+/// Tell the page bridge whether the popup is open: while it is, the bridge
+/// reports state every second even if its own window is hidden.
+fn send_popup_visibility<R: Runtime>(app: &AppHandle<R>, visible: bool) {
+    if let Some(main) = app.get_webview_window(MAIN_LABEL) {
+        eval_popup_visibility(&main, visible);
+    }
+}
+
+fn eval_popup_visibility<R: Runtime>(main: &WebviewWindow<R>, visible: bool) {
+    let _ = main.eval(format!(
+        "window.__flit__&&window.__flit__.setPopupVisible&&window.__flit__.setPopupVisible({visible})"
+    ));
 }
 
 /// Called when the popup reports it lost focus. Focus can flicker between the
@@ -186,6 +202,13 @@ pub fn hide_main_window<R: Runtime>(app: &AppHandle<R>) {
 pub fn sync_main_visibility<R: Runtime>(win: &WebviewWindow<R>, force: bool) {
     let visible = win.is_visible().unwrap_or(true) && !win.is_minimized().unwrap_or(false);
     send_main_visibility(win, visible, force);
+}
+
+/// Bring a freshly loaded page bridge up to date with both window states.
+pub fn sync_bridge<R: Runtime>(main: &WebviewWindow<R>) {
+    sync_main_visibility(main, true);
+    let popup_open = main.state::<PlayerHub>().popup_visible();
+    eval_popup_visibility(main, popup_open);
 }
 
 fn send_main_visibility<R: Runtime>(win: &WebviewWindow<R>, visible: bool, force: bool) {

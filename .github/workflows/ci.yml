@@ -69,12 +69,15 @@ jobs:
         working-directory: src-tauri
         run: cargo test --locked
 
-      # The Windows-only `wry` dependency must match the version Tauri uses,
-      # or the app silently compiles two copies of it.
-      - name: Single wry version
+      # The Windows-only `wry` and `webview2-com` dependencies must match the
+      # versions Tauri uses, or the app silently compiles two copies of them
+      # (and WebView2 types from one copy don't fit the other).
+      - name: Single wry / webview2-com version
         if: runner.os == 'Linux'
         working-directory: src-tauri
         run: |
-          versions=$(cargo tree --target all -e normal --prefix none | sed -n 's/^wry v\([^ ]*\).*/\1/p' | sort -u)
-          echo "wry versions: $versions"
-          test "$(echo "$versions" | wc -l)" -eq 1
+          for crate in wry webview2-com; do
+            versions=$(cargo tree --target all -e normal --prefix none | sed -n "s/^${crate} v\([^ ]*\).*/\1/p" | sort -u)
+            echo "${crate} versions: ${versions}"
+            test "$(echo "$versions" | wc -l)" -eq 1
+          done

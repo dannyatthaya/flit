@@ -2,6 +2,17 @@
 
 The publish workflow copies the section for the tag being released into the GitHub release notes.
 
+## Unreleased
+
+### Improved
+
+- Lower background CPU use: while neither the window nor the mini-player is on screen, Flit no longer polls the player; it reacts to play/pause/track changes and refreshes as soon as you open the mini-player.
+- The queue is only re-read when it changes, instead of every second.
+- The mini-player's webview is created the first time you open it and closed after 10 minutes hidden, saving a web renderer's worth of memory.
+- Windows: the YouTube Music webview is asked to trim its memory while the window is hidden or minimized.
+- Updates are downloaded when you click **Update** instead of in advance, so a pending update no longer sits in memory (up to ~100 MB for the Linux AppImage).
+- The app is about 0.4 MB smaller: icon source files are no longer bundled.
+
 ## 0.2.0
 
 > **Updating from 0.1.0:** 0.1.0 never checks for updates, so download and install 0.2.0 from this release page once. From 0.2.0 on, Flit updates itself.

@@ -207,6 +207,13 @@ impl PlayerHub {
         self.send(true);
     }
 
+    /// The popup webview was closed; stop sending to its channel.
+    pub fn unsubscribe(&self) {
+        if let Ok(mut slot) = self.channel.lock() {
+            *slot = None;
+        }
+    }
+
     pub fn popup_visible(&self) -> bool {
         self.popup_visible.load(Ordering::Relaxed)
     }

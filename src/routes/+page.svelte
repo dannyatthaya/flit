@@ -45,7 +45,7 @@
     | { state: "checking" }
     | { state: "upToDate" }
     | { state: "downloading"; version: string; percent: number | null }
-    | { state: "ready"; version: string }
+    | { state: "available"; version: string }
     | { state: "installing"; version: string }
     | { state: "error"; message: string };
 
@@ -99,7 +99,11 @@
   const art = $derived(s.artworkData || s.artworkUrl || "");
   const accent = $derived(/^#[0-9a-f]{6}$/i.test(s.color) ? s.color : DEFAULT_ACCENT);
   const hasTrack = $derived(!!s.title);
-  const updateReady = $derived(update.state === "ready" || update.state === "installing");
+  /** An update was found, or is being downloaded / installed. */
+  const updateActive = $derived(
+    update.state === "available" || update.state === "downloading" || update.state === "installing",
+  );
+  const updateBusy = $derived(update.state === "downloading" || update.state === "installing");
 
   function fmt(sec: number): string {
     if (!isFinite(sec) || sec < 0) sec = 0;
@@ -111,6 +115,10 @@
   /** Rust leaves out `artworkData` and `queue` when they haven't changed. */
   type PlayerMessage = Omit<PlayerState, "artworkData" | "queue"> &
     Partial<Pick<PlayerState, "artworkData" | "queue">>;
+
+  function assign<K extends keyof PlayerState>(key: K, value: PlayerState[K]) {
+    if (s[key] !== value) s[key] = value;
+  }
 
   function applyState(next: PlayerMessage) {
     const now = Date.now();
@@ -129,7 +137,15 @@
       if (merged.repeat === repeatHold.value || now > repeatHold.until) repeatHold = null;
       else merged.repeat = repeatHold.value;
     }
-    s = merged;
+    // Update only what changed: with fine-grained reactivity, a field that is
+    // re-assigned the same value still re-runs everything that reads it, and
+    // replacing the whole object would re-check the queue list every second.
+    for (const key of Object.keys(merged) as (keyof PlayerState)[]) {
+      if (key === "queue" || key === "artworkData") continue;
+      assign(key, merged[key]);
+    }
+    if (next.artworkData !== undefined) assign("artworkData", next.artworkData);
+    if (next.queue !== undefined) s.queue = next.queue;
 
     if (seekHold && (Math.abs(merged.positionSec - seekHold.value) < 2 || now > seekHold.until)) {
       seekHold = null;
@@ -232,6 +248,18 @@
       refreshUpdate();
     });
   }
+  function pillLabel(u: UpdateStatus): string {
+    switch (u.state) {
+      case "installing":
+        return "Installing…";
+      case "downloading":
+        return u.percent != null ? `Downloading ${u.percent}%` : "Downloading…";
+      case "available":
+        return `Update to ${u.version}`;
+      default:
+        return "";
+    }
+  }
   function updateLabel(u: UpdateStatus): string {
     switch (u.state) {
       case "checking":
@@ -240,8 +268,8 @@
         return "Flit is up to date";
       case "downloading":
         return `Downloading ${u.version}${u.percent != null ? ` (${u.percent}%)` : "…"}`;
-      case "ready":
-        return `Version ${u.version} is ready to install`;
+      case "available":
+        return `Version ${u.version} is available`;
       case "installing":
         return `Installing ${u.version}…`;
       case "error":
@@ -272,9 +300,9 @@
   <header data-tauri-drag-region>
     <span class="brand" data-tauri-drag-region>Flit</span>
     <div class="hbtns">
-      {#if updateReady}
-        <button class="pill" onclick={installUpdate} disabled={update.state === "installing"} title={updateLabel(update)}>
-          {update.state === "installing" ? "Installing…" : "Restart to update"}
+      {#if updateActive}
+        <button class="pill" onclick={installUpdate} disabled={updateBusy} title={updateLabel(update)}>
+          {pillLabel(update)}
         </button>
       {/if}
       <button class="icon" class:on={pinned} title={pinned ? "Unpin (hide when clicking elsewhere)" : "Pin (keep open)"} onclick={togglePin} aria-label="Keep open" aria-pressed={pinned}>{#if pinned}<IconPinned />{:else}<IconPin />{/if}</button>
@@ -379,10 +407,10 @@
         <span>Updates</span>
         <div class="uprow">
           <span class="ustatus">{updateLabel(update)}</span>
-          {#if updateReady}
-            <button class="go" onclick={installUpdate} disabled={update.state === "installing"}>Restart</button>
+          {#if updateActive}
+            <button class="go" onclick={installUpdate} disabled={updateBusy}>Update</button>
           {:else}
-            <button class="go" onclick={checkForUpdates} disabled={update.state === "checking" || update.state === "downloading"}>Check</button>
+            <button class="go" onclick={checkForUpdates} disabled={update.state === "checking"}>Check</button>
           {/if}
         </div>
         {#if updateError}<div class="err">{updateError}</div>{/if}

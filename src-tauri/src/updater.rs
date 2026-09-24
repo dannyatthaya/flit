@@ -1,11 +1,14 @@
-//! Auto-updater: checks GitHub Releases in the background, downloads a newer
-//! signed build (the plugin verifies the minisign signature against the
-//! `pubkey` in tauri.conf.json), and installs it when the user clicks
-//! "Restart to update" in the tray popup.
+//! Auto-updater: checks GitHub Releases in the background and, when the user
+//! clicks "Update" in the tray popup, downloads the newer signed build (the
+//! plugin verifies the minisign signature against the `pubkey` in
+//! tauri.conf.json), installs it and restarts.
+//!
+//! The download only starts on that click: installers are 5–100 MB (a Linux
+//! AppImage is the large end), and holding one in memory for hours until the
+//! user gets round to it would dwarf the app's own footprint.
 //!
 //! All updater calls happen in Rust, so no webview holds updater permissions.
-//! The popup only reads the status and asks to install the already-verified
-//! download.
+//! The popup only reads the status and asks to install the verified update.
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,12 +29,12 @@ pub enum UpdateStatus {
     Idle,
     Checking,
     UpToDate,
+    Available {
+        version: String,
+    },
     Downloading {
         version: String,
         percent: Option<u8>,
-    },
-    Ready {
-        version: String,
     },
     Installing {
         version: String,
@@ -44,8 +47,9 @@ pub enum UpdateStatus {
 #[derive(Default)]
 pub struct Updater {
     status: Mutex<UpdateStatus>,
+    /// The newest update found; downloaded only when the user installs it.
     #[cfg(desktop)]
-    pending: Mutex<Option<(tauri_plugin_updater::Update, Vec<u8>)>>,
+    pending: Mutex<Option<tauri_plugin_updater::Update>>,
     busy: AtomicBool,
 }
 
@@ -54,35 +58,35 @@ impl Updater {
         self.status.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
-    /// Version of the downloaded update waiting to be installed, if any.
+    /// Version of the update waiting to be installed, if any.
     fn pending_version(&self) -> Option<String> {
         #[cfg(desktop)]
         {
             self.pending
                 .lock()
                 .ok()
-                .and_then(|p| p.as_ref().map(|(u, _)| u.version.clone()))
+                .and_then(|p| p.as_ref().map(|u| u.version.clone()))
         }
         #[cfg(not(desktop))]
         None
     }
 
     fn set_status<R: Runtime>(&self, app: &AppHandle<R>, status: UpdateStatus) {
-        let ready_version = match &status {
-            UpdateStatus::Ready { version } => Some(version.clone()),
+        let available_version = match &status {
+            UpdateStatus::Available { version } => Some(version.clone()),
             _ => None,
         };
         if let Ok(mut s) = self.status.lock() {
             *s = status;
         }
         let _ = app.emit_to(crate::tray::POPUP_LABEL, STATUS_EVENT, ());
-        if let Some(version) = ready_version {
+        if let Some(version) = available_version {
             notify_main_window(app, &version);
         }
     }
 }
 
-/// Show a small "update ready" notice inside the YouTube Music window.
+/// Show a small "update available" notice inside the YouTube Music window.
 fn notify_main_window<R: Runtime>(app: &AppHandle<R>, version: &str) {
     let Some(win) = app.get_webview_window(crate::tray::MAIN_LABEL) else {
         return;
@@ -115,26 +119,23 @@ pub fn spawn_background_checks<R: Runtime>(app: &AppHandle<R>) {
     std::thread::spawn(move || {
         std::thread::sleep(FIRST_CHECK_DELAY);
         loop {
-            tauri::async_runtime::block_on(check_and_download(&app));
+            tauri::async_runtime::block_on(check(&app));
             std::thread::sleep(CHECK_INTERVAL);
         }
     });
 }
 
-/// Check for an update and download it so it is ready to install. Once one is
-/// downloaded, later checks only replace it with a strictly newer version.
-/// Does nothing while another check/download or an install is running.
-pub async fn check_and_download<R: Runtime>(app: &AppHandle<R>) {
+/// Look for an update. Once one is found, later checks only replace it with a
+/// strictly newer version. Does nothing while a check, download or install
+/// is running.
+pub async fn check<R: Runtime>(app: &AppHandle<R>) {
     let state = app.state::<Updater>();
-    if matches!(state.status(), UpdateStatus::Installing { .. }) {
-        return;
-    }
     if state.busy.swap(true, Ordering::SeqCst) {
         return;
     }
     let result = run_check(app, &state).await;
-    // With an update already downloaded, a failed re-check must not hide the
-    // "Restart to update" button; keep offering what we have.
+    // With an update already found, a failed re-check must not hide the
+    // "Update" button; keep offering what we have.
     if let Err(message) = result {
         if state.pending_version().is_none() {
             state.set_status(app, UpdateStatus::Error { message });
@@ -158,9 +159,8 @@ fn is_newer(candidate: &str, current: &str) -> bool {
 async fn run_check<R: Runtime>(app: &AppHandle<R>, state: &Updater) -> Result<(), String> {
     use tauri_plugin_updater::{Error as UpdaterError, UpdaterExt};
 
-    // Once an update is downloaded, later checks run quietly: the popup keeps
-    // showing "Restart to update" and only switches to a newer download once
-    // that one is complete.
+    // Once an update has been found, later checks run quietly: the popup
+    // keeps offering it and only switches when a newer one appears.
     let pending = state.pending_version();
     let quiet = pending.is_some();
     if !quiet {
@@ -184,17 +184,57 @@ async fn run_check<R: Runtime>(app: &AppHandle<R>, state: &Updater) -> Result<()
             return Ok(());
         }
     }
-
     let version = clean_version(&update.version);
-    if !quiet {
+    if let Ok(mut slot) = state.pending.lock() {
+        *slot = Some(update);
+    }
+    state.set_status(app, UpdateStatus::Available { version });
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+async fn run_check<R: Runtime>(_app: &AppHandle<R>, _state: &Updater) -> Result<(), String> {
+    Err("updates are not supported on this platform".into())
+}
+
+/// Download the update the user asked for, install it and restart. On
+/// Windows the installer exits the app itself. On failure the update stays
+/// on offer so the user can retry.
+#[cfg(desktop)]
+pub async fn download_and_install<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let state = app.state::<Updater>();
+    if state.busy.swap(true, Ordering::SeqCst) {
+        return Err("An update check is running; try again in a moment.".into());
+    }
+    let result = run_install(app, &state).await;
+    state.busy.store(false, Ordering::SeqCst);
+    result
+}
+
+#[cfg(desktop)]
+async fn run_install<R: Runtime>(app: &AppHandle<R>, state: &Updater) -> Result<(), String> {
+    let update = state.pending.lock().ok().and_then(|p| p.clone());
+    let Some(update) = update else {
+        return Err("No update is available".into());
+    };
+    let version = clean_version(&update.version);
+    let offer_again = |message: String| {
         state.set_status(
             app,
-            UpdateStatus::Downloading {
+            UpdateStatus::Available {
                 version: version.clone(),
-                percent: Some(0),
             },
         );
-    }
+        message
+    };
+
+    state.set_status(
+        app,
+        UpdateStatus::Downloading {
+            version: version.clone(),
+            percent: Some(0),
+        },
+    );
     let mut received: u64 = 0;
     let mut last_percent: Option<u8> = Some(0);
     let bytes = update
@@ -204,7 +244,7 @@ async fn run_check<R: Runtime>(app: &AppHandle<R>, state: &Updater) -> Result<()
                 let percent = total
                     .filter(|t| *t > 0)
                     .map(|t| ((received * 100) / t).min(100) as u8);
-                if !quiet && percent != last_percent {
+                if percent != last_percent {
                     last_percent = percent;
                     state.set_status(
                         app,
@@ -218,49 +258,25 @@ async fn run_check<R: Runtime>(app: &AppHandle<R>, state: &Updater) -> Result<()
             || {},
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| offer_again(e.to_string()))?;
 
-    if let Ok(mut pending) = state.pending.lock() {
-        *pending = Some((update, bytes));
-    }
-    state.set_status(app, UpdateStatus::Ready { version });
-    Ok(())
-}
-
-#[cfg(not(desktop))]
-async fn run_check<R: Runtime>(_app: &AppHandle<R>, _state: &Updater) -> Result<(), String> {
-    Err("updates are not supported on this platform".into())
-}
-
-/// Install the downloaded update and restart. On Windows the installer exits
-/// the app itself.
-#[cfg(desktop)]
-pub fn install<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    let state = app.state::<Updater>();
-    let pending = state.pending.lock().ok().and_then(|mut p| p.take());
-    let Some((update, bytes)) = pending else {
-        return Err("no update has been downloaded".into());
-    };
-    let version = clean_version(&update.version);
     state.set_status(
         app,
         UpdateStatus::Installing {
             version: version.clone(),
         },
     );
-    if let Err(e) = update.install(&bytes) {
-        // Keep the download so the user can retry.
-        if let Ok(mut p) = state.pending.lock() {
-            *p = Some((update, bytes));
-        }
-        state.set_status(app, UpdateStatus::Ready { version });
-        return Err(e.to_string());
-    }
+    // Installing can copy a large bundle or wait on a password prompt (Linux
+    // packages), so keep it off the async workers.
+    tauri::async_runtime::spawn_blocking(move || update.install(bytes))
+        .await
+        .map_err(|e| offer_again(e.to_string()))?
+        .map_err(|e| offer_again(e.to_string()))?;
     app.restart();
 }
 
 #[cfg(not(desktop))]
-pub fn install<R: Runtime>(_app: &AppHandle<R>) -> Result<(), String> {
+pub async fn download_and_install<R: Runtime>(_app: &AppHandle<R>) -> Result<(), String> {
     Err("updates are not supported on this platform".into())
 }
 

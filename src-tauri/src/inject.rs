@@ -271,35 +271,57 @@ pub const INJECT_JS: &str = r#"
     });
   }
 
-  function isPlaying() {
-    var v = video();
+  // Everything one update needs from the page, looked up once per update
+  // instead of once per field.
+  function snapshot() {
+    var app = document.querySelector('ytmusic-app');
+    var store = null;
+    try {
+      if (app && app.store && typeof app.store.getState === 'function') store = app.store.getState();
+    } catch (e) {}
+    return { video: video(), bar: playerBar(), player: moviePlayer(), store: store };
+  }
+
+  function isPlaying(v) {
+    if (v === undefined) v = video();
     if (v) return !v.paused && !v.ended;
     return !!(navigator.mediaSession && navigator.mediaSession.playbackState === 'playing');
   }
 
-  function likeStatus() {
-    var r = q('ytmusic-player-bar ytmusic-like-button-renderer');
+  function likeStatus(bar) {
+    var r = bar && q('ytmusic-like-button-renderer', bar);
     var st = r && (r.getAttribute('like-status') || '').toUpperCase();
     if (st === 'LIKE') return 'like';
     if (st === 'DISLIKE') return 'dislike';
     return 'none';
   }
 
-  function ytmStore() {
-    try {
-      var app = document.querySelector('ytmusic-app');
-      if (app && app.store && typeof app.store.getState === 'function') return app.store.getState();
-    } catch (e) {}
-    return null;
-  }
-
   function label(el) {
     return ((el && (el.getAttribute('aria-label') || el.getAttribute('title'))) || '').toLowerCase();
   }
 
-  function shuffleOn() {
-    var st = ytmStore();
-    var qs = st && st.queue;
+  // Last resort for shuffle: guess from the icon colour. Reading computed
+  // style can force a style recalculation, so reuse the answer for a while.
+  var shuffleColorCache = { el: null, at: 0, on: false };
+  function shuffleFromColor(b) {
+    var now = Date.now();
+    if (shuffleColorCache.el === b && now - shuffleColorCache.at < 5000) return shuffleColorCache.on;
+    var on = false;
+    try {
+      var iconEl = b.querySelector('yt-icon, tp-yt-iron-icon, svg') || b;
+      var m = (getComputedStyle(iconEl).color || '').match(/(\d+(?:\.\d+)?)/g);
+      if (m && m.length >= 3) {
+        var lum = (+m[0] + +m[1] + +m[2]) / 3;
+        var alpha = m.length >= 4 ? +m[3] : 1;
+        on = alpha >= 0.9 && lum >= 190;
+      }
+    } catch (e) {}
+    shuffleColorCache = { el: b, at: now, on: on };
+    return on;
+  }
+
+  function shuffleOn(snap) {
+    var qs = snap.store && snap.store.queue;
     if (qs && typeof qs.shuffleEnabled === 'boolean') return qs.shuffleEnabled;
     var b = first(SEL.shuffle);
     if (!b) return false;
@@ -310,16 +332,7 @@ pub const INJECT_JS: &str = r#"
     var l = label(b);
     if (/\boff\b/.test(l)) return false;
     if (/\bon\b/.test(l)) return true;
-    try {
-      var iconEl = b.querySelector('yt-icon, tp-yt-iron-icon, svg') || b;
-      var m = (getComputedStyle(iconEl).color || '').match(/(\d+(?:\.\d+)?)/g);
-      if (m && m.length >= 3) {
-        var lum = (+m[0] + +m[1] + +m[2]) / 3;
-        var alpha = m.length >= 4 ? +m[3] : 1;
-        return alpha >= 0.9 && lum >= 190;
-      }
-    } catch (e) {}
-    return false;
+    return shuffleFromColor(b);
   }
 
   // Map YouTube's repeat enums ("REPEAT_MODE_ONE", "ALL", "NONE", ...) exactly;
@@ -332,11 +345,10 @@ pub const INJECT_JS: &str = r#"
     return null;
   }
 
-  function repeatMode() {
-    var st = ytmStore();
-    var m = st && st.queue && normRepeat(st.queue.repeatMode);
+  function repeatMode(snap) {
+    var m = snap.store && snap.store.queue && normRepeat(snap.store.queue.repeatMode);
     if (m) return m;
-    var bar = playerBar();
+    var bar = snap.bar;
     if (bar) {
       m = normRepeat(bar.repeatMode) || normRepeat(bar.getAttribute('repeat-mode')) ||
           normRepeat(bar.getAttribute('repeat-mode_'));
@@ -348,14 +360,14 @@ pub const INJECT_JS: &str = r#"
     return 'none';
   }
 
-  function volumeState() {
-    var p = moviePlayer();
+  function volumeState(snap) {
+    var p = snap.player;
     try {
       if (p && typeof p.getVolume === 'function') {
         return { volume: p.getVolume(), muted: typeof p.isMuted === 'function' ? !!p.isMuted() : false };
       }
     } catch (e) {}
-    var v = video();
+    var v = snap.video;
     if (v) return { volume: Math.round(v.volume * 100), muted: !!v.muted };
     return { volume: null, muted: false };
   }
@@ -391,18 +403,47 @@ pub const INJECT_JS: &str = r#"
     return out;
   }
 
+  // Walking the queue is the most expensive read, so it only happens when the
+  // queue element reported a change (plus a periodic safety re-read, and a
+  // faster one while the queue element hasn't rendered yet).
+  var QUEUE_MAX_AGE_MS = 10000, QUEUE_UNWATCHED_MAX_AGE_MS = 3000;
+  var queue = { list: [], json: '[]', dirty: true, readAt: 0, el: null, observer: null };
+  function watchQueueElement() {
+    if (queue.el && queue.el.isConnected) return true;
+    if (queue.observer) { queue.observer.disconnect(); queue.observer = null; }
+    queue.el = document.querySelector('ytmusic-player-queue');
+    if (!queue.el) return false;
+    try {
+      queue.observer = new MutationObserver(function () { queue.dirty = true; });
+      queue.observer.observe(queue.el, { childList: true, subtree: true, characterData: true });
+    } catch (e) { queue.observer = null; return false; }
+    queue.dirty = true;
+    return true;
+  }
+  function refreshQueue() {
+    var observed = watchQueueElement();
+    var age = Date.now() - queue.readAt;
+    if (queue.dirty || age > (observed ? QUEUE_MAX_AGE_MS : QUEUE_UNWATCHED_MAX_AGE_MS)) {
+      queue.list = readQueue();
+      queue.json = JSON.stringify(queue.list);
+      queue.dirty = false;
+      queue.readAt = Date.now();
+    }
+  }
+
   // Heavy fields are only sent when they change; Rust keeps the last copy.
   var sentArtKey = '', sentQueueJson = '', lastJson = '', lastEmitAt = 0;
   var HEARTBEAT_MS = 15000;
 
   function buildState() {
-    var v = video();
+    var snap = snapshot();
+    var v = snap.video;
     var meta = readMeta();
     var videoId = currentVideoId(meta.artwork);
     var key = videoId || meta.artwork || '';
     ensureArt(key, videoId, meta.artwork);
     var ready = art.key === key && art.status === 'ready';
-    var vol = volumeState();
+    var vol = volumeState(snap);
     return {
       title: meta.title,
       artist: meta.artist,
@@ -412,11 +453,11 @@ pub const INJECT_JS: &str = r#"
       color: ready ? art.color : '',
       durationSec: v && isFinite(v.duration) ? v.duration : 0,
       positionSec: v ? (v.currentTime || 0) : 0,
-      playing: isPlaying(),
+      playing: isPlaying(v),
       videoId: videoId,
-      shuffle: shuffleOn(),
-      repeat: repeatMode(),
-      likeStatus: likeStatus(),
+      shuffle: shuffleOn(snap),
+      repeat: repeatMode(snap),
+      likeStatus: likeStatus(snap.bar),
       volume: vol.volume,
       muted: vol.muted,
       __artReady: ready
@@ -444,6 +485,10 @@ pub const INJECT_JS: &str = r#"
     if (popupVisible && !was) refreshNow();
   }
 
+  // With nobody watching, the timer only runs as a slow heartbeat: opening
+  // the popup or showing the window refreshes at once, and play/pause/track
+  // changes still arrive through the video's events below.
+  var WATCHED_PLAYING_MS = 1000, WATCHED_PAUSED_MS = 2000, UNWATCHED_MS = 60000;
   var timer = null, lastSampleAt = 0;
   function tick() {
     sample();
@@ -453,21 +498,23 @@ pub const INJECT_JS: &str = r#"
   function sample() {
     lastSampleAt = Date.now();
     try {
+      var isWatched = watched();
       var state = buildState();
       var artReady = state.__artReady;
       delete state.__artReady;
-      var queue = readQueue();
-      var queueJson = JSON.stringify(queue);
-      var json = JSON.stringify(state) + queueJson;
+      // Nobody can see the queue unless someone is watching, so don't walk it.
+      if (isWatched) refreshQueue();
+      var json = JSON.stringify(state) + queue.json;
       var now = Date.now();
-      if (json !== lastJson || artReady && sentArtKey !== state.artKey || now - lastEmitAt > HEARTBEAT_MS) {
+      var changed = json !== lastJson || (artReady && sentArtKey !== state.artKey);
+      if (changed || (isWatched && now - lastEmitAt > HEARTBEAT_MS)) {
         if (artReady && sentArtKey !== state.artKey && art.dataUri) {
           state.artworkData = art.dataUri;
           sentArtKey = state.artKey;
         }
-        if (queueJson !== sentQueueJson) {
-          state.queue = queue;
-          sentQueueJson = queueJson;
+        if (queue.json !== sentQueueJson) {
+          state.queue = queue.list;
+          sentQueueJson = queue.json;
         }
         emit('flit-state', state);
         lastJson = json;
@@ -476,7 +523,7 @@ pub const INJECT_JS: &str = r#"
     } catch (e) {}
   }
   function scheduleNext() {
-    var delay = watched() ? (isPlaying() ? 1000 : 2000) : 5000;
+    var delay = watched() ? (isPlaying() ? WATCHED_PLAYING_MS : WATCHED_PAUSED_MS) : UNWATCHED_MS;
     timer = setTimeout(tick, delay);
   }
 
@@ -542,7 +589,7 @@ pub const INJECT_JS: &str = r#"
       toast.id = 'flit-toast';
       toast.setAttribute('role', 'status');
       var msg = document.createElement('span');
-      msg.textContent = 'Flit ' + String(version).slice(0, 64) + ' is ready to install.';
+      msg.textContent = 'Flit ' + String(version).slice(0, 64) + ' is available.';
       var open = document.createElement('button');
       open.textContent = 'Open widget';
       open.addEventListener('click', function () { toast.remove(); emit('flit-toggle-popup', {}); });

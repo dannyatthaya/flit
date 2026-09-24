@@ -149,33 +149,7 @@ pub fn run() {
                 });
             }
 
-            let popup = WebviewWindowBuilder::new(
-                handle,
-                tray::POPUP_LABEL,
-                WebviewUrl::App("index.html".into()),
-            )
-            .title("Flit")
-            .inner_size(tray::POPUP_WIDTH, tray::POPUP_COMPACT_HEIGHT)
-            .min_inner_size(tray::POPUP_WIDTH, tray::MIN_POPUP_HEIGHT)
-            .decorations(false)
-            .resizable(false)
-            .skip_taskbar(true)
-            .always_on_top(true)
-            .visible(false)
-            .build()?;
-
-            {
-                let h = handle.clone();
-                popup.on_window_event(move |event| match event {
-                    // Alt+F4 etc. would destroy the popup for good; hide it instead.
-                    WindowEvent::CloseRequested { api, .. } => {
-                        api.prevent_close();
-                        tray::hide_popup(&h);
-                    }
-                    WindowEvent::Focused(false) => tray::popup_blurred(&h),
-                    _ => {}
-                });
-            }
+            // The popup webview is created on first open (see tray.rs).
 
             tray::build_tray(handle)?;
 

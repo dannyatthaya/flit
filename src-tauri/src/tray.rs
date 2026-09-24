@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, LogicalSize, Manager, Monitor, PhysicalPosition, Runtime, WebviewWindow,
+    window::Color,
+    AppHandle, LogicalSize, Manager, Monitor, PhysicalPosition, Runtime, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent,
 };
 
 use crate::player::PlayerHub;
@@ -23,8 +25,17 @@ const EDGE_MARGIN: f64 = 8.0;
 /// A tray click this soon after the popup hid itself on blur is the click that
 /// caused the blur; it must not immediately re-open the popup.
 const BLUR_REOPEN_GUARD: Duration = Duration::from_millis(350);
+/// The popup is its own webview (a separate renderer process), so it is only
+/// created when first opened and closed again after staying hidden this long.
+const POPUP_IDLE_CLOSE: Duration = Duration::from_secs(10 * 60);
+/// Matches the popup's background, so a freshly created popup doesn't flash
+/// white while its page loads.
+const POPUP_BACKGROUND: Color = Color(16, 16, 20, 255);
 
 static RESIZE_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Bumped whenever the popup is shown or hidden; an idle-close timer only
+/// fires if nothing happened since it was started.
+static POPUP_HIDE_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// While pinned, the popup stays open when it loses focus.
 static POPUP_PINNED: AtomicBool = AtomicBool::new(false);
 /// Last visibility sent to the page bridge: 0 = none yet, 1 = visible, 2 = hidden.
@@ -75,10 +86,54 @@ fn popup<R: Runtime>(app: &AppHandle<R>) -> Option<WebviewWindow<R>> {
     app.get_webview_window(POPUP_LABEL)
 }
 
+fn create_popup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<WebviewWindow<R>> {
+    let popup = WebviewWindowBuilder::new(app, POPUP_LABEL, WebviewUrl::App("index.html".into()))
+        .title("Flit")
+        .inner_size(POPUP_WIDTH, POPUP_COMPACT_HEIGHT)
+        .min_inner_size(POPUP_WIDTH, MIN_POPUP_HEIGHT)
+        .decorations(false)
+        .resizable(false)
+        .skip_taskbar(true)
+        .always_on_top(true)
+        .visible(false)
+        .background_color(POPUP_BACKGROUND)
+        .build()?;
+    let h = app.clone();
+    popup.on_window_event(move |event| match event {
+        // Alt+F4 etc. would destroy the popup behind our back; hide it instead.
+        WindowEvent::CloseRequested { api, .. } => {
+            api.prevent_close();
+            hide_popup(&h);
+        }
+        WindowEvent::Focused(false) => popup_blurred(&h),
+        _ => {}
+    });
+    Ok(popup)
+}
+
 /// Show the popup near `anchor` (physical screen coordinates), or hide it if
 /// it is already visible. Without an anchor it opens in a screen corner.
 pub fn toggle_popup<R: Runtime>(app: &AppHandle<R>, anchor: Option<PhysicalPosition<f64>>) {
-    let Some(win) = popup(app) else { return };
+    let Some(win) = popup(app) else {
+        // Create it from the event loop: building a webview while handling a
+        // webview message (e.g. the page's "open widget" event) can deadlock
+        // on Windows.
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let win = match popup(&h) {
+                Some(win) => win,
+                None => match create_popup(&h) {
+                    Ok(win) => win,
+                    Err(e) => {
+                        eprintln!("[flit] could not create the popup: {e}");
+                        return;
+                    }
+                },
+            };
+            show_popup(&h, &win, anchor);
+        });
+        return;
+    };
     if win.is_visible().unwrap_or(false) {
         hide_popup(app);
         return;
@@ -91,10 +146,19 @@ pub fn toggle_popup<R: Runtime>(app: &AppHandle<R>, anchor: Option<PhysicalPosit
     if recently_blurred {
         return;
     }
-    position_popup(&win, anchor);
+    show_popup(app, &win, anchor);
+}
+
+fn show_popup<R: Runtime>(
+    app: &AppHandle<R>,
+    win: &WebviewWindow<R>,
+    anchor: Option<PhysicalPosition<f64>>,
+) {
+    POPUP_HIDE_GENERATION.fetch_add(1, Ordering::SeqCst);
+    position_popup(win, anchor);
     let _ = win.show();
     let _ = win.set_focus();
-    strip_dwm_border(&win);
+    strip_dwm_border(win);
     app.state::<PlayerHub>().set_popup_visible(true);
     send_popup_visibility(app, true);
 }
@@ -105,6 +169,34 @@ pub fn hide_popup<R: Runtime>(app: &AppHandle<R>) {
     }
     app.state::<PlayerHub>().set_popup_visible(false);
     send_popup_visibility(app, false);
+    schedule_idle_close(app);
+}
+
+/// Close the popup's webview once it has stayed hidden for a while; the next
+/// open creates it again.
+fn schedule_idle_close<R: Runtime>(app: &AppHandle<R>) {
+    let generation = POPUP_HIDE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(POPUP_IDLE_CLOSE);
+        if POPUP_HIDE_GENERATION.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if POPUP_HIDE_GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let Some(win) = popup(&h) else { return };
+            if win.is_visible().unwrap_or(true) {
+                return;
+            }
+            h.state::<PlayerHub>().unsubscribe();
+            // A new popup starts unpinned.
+            set_popup_pinned(false);
+            let _ = win.destroy();
+        });
+    });
 }
 
 /// Tell the page bridge whether the popup is open: while it is, the bridge
@@ -216,6 +308,7 @@ fn send_main_visibility<R: Runtime>(win: &WebviewWindow<R>, visible: bool, force
     if MAIN_VISIBILITY_SENT.swap(code, Ordering::Relaxed) == code && !force {
         return;
     }
+    set_webview_memory_level(win, !visible);
     let _ = win.eval(format!(
         "window.__flit__&&window.__flit__.setWindowVisible&&window.__flit__.setWindowVisible({visible})"
     ));
@@ -373,3 +466,35 @@ fn set_bounds<R: Runtime>(
     let _ = win.set_position(PhysicalPosition::new(pos.0, pos.1));
     let _ = win.set_size(LogicalSize::new(POPUP_WIDTH, logical_h));
 }
+
+/// Windows: tell WebView2 how hard to hold on to memory. While the YouTube
+/// Music window is hidden or minimized it may trim caches and other memory it
+/// can rebuild; playback and scripts keep running.
+#[cfg(windows)]
+fn set_webview_memory_level<R: Runtime>(win: &WebviewWindow<R>, low: bool) {
+    let _ = win.with_webview(move |webview| {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+        };
+        use windows_core::Interface;
+        let level = if low {
+            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
+        } else {
+            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
+        };
+        // SAFETY: plain COM calls on the live WebView2 controller that Tauri
+        // hands to this callback; runtimes without ICoreWebView2_19 (older
+        // than WebView2 1.0.1774) fail the cast and are left alone.
+        unsafe {
+            if let Ok(core) = webview.controller().CoreWebView2() {
+                if let Ok(core19) = core.cast::<ICoreWebView2_19>() {
+                    let _ = core19.SetMemoryUsageTargetLevel(level);
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn set_webview_memory_level<R: Runtime>(_win: &WebviewWindow<R>, _low: bool) {}

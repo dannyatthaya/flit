@@ -38,6 +38,10 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphic
 # Read the installed WebView2 (Chromium) version for an accurate user agent.
 # Keep the version in step with the one tauri-runtime-wry uses (see Cargo.lock).
 wry = { version = "0.55", default-features = false, features = ["os-webview"] }
+# Set WebView2's memory target while the window is hidden (see tray.rs). Keep
+# these in step with the versions tauri-runtime-wry uses (see Cargo.lock).
+webview2-com = "0.38"
+windows-core = "0.61"
 
 # Optimize the release build for a small, fast binary (design goal #1).
 [profile.release]

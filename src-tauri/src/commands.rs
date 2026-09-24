@@ -125,17 +125,15 @@ pub fn update_status(updater: State<Updater>) -> UpdateStatus {
 
 #[tauri::command]
 pub async fn update_check<R: Runtime>(app: AppHandle<R>) -> UpdateStatus {
-    crate::updater::check_and_download(&app).await;
+    crate::updater::check(&app).await;
     app.state::<Updater>().status()
 }
 
-/// Async so the install (which can copy a large bundle or wait on a password
-/// prompt on Linux) runs off the main thread and never freezes the UI.
+/// Downloads, installs and restarts. Async, so the download and install never
+/// block the main thread.
 #[tauri::command]
 pub async fn update_install<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || crate::updater::install(&app))
-        .await
-        .map_err(|e| e.to_string())?
+    crate::updater::download_and_install(&app).await
 }
 
 /// Keep the popup open when it loses focus (the pin button in its header).

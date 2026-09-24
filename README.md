@@ -8,7 +8,7 @@ Flit wraps **music.youtube.com** in a native OS webview (via [Tauri 2](https://v
 
 ## Why Flit
 
-- **Lightweight & fast.** Uses the OS's native webview — no bundled Chromium, no Electron. The goal is for the app's own overhead (excluding the YouTube Music page) to stay in the low tens of MB. Player state is sampled every 1 s while playing, every 2 s while paused, and every 5 s while the YouTube Music window is hidden. It is only sent when something changed, the album art and queue only when they change, and nothing is forwarded to the mini-player while it is closed.
+- **Lightweight & fast.** Uses the OS's native webview — no bundled Chromium, no Electron. The goal is for the app's own overhead (excluding the YouTube Music page) to stay in the low tens of MB. While you can see the player (the window or the mini-player is open), its state is sampled every 1 s while playing and every 2 s while paused. While nothing is on screen, Flit only reacts to the player's own events (play, pause, track changes) plus a once-a-minute heartbeat. State is only sent when something changed, the queue is only re-read when it changes, and the album art is only sent once per track. The mini-player's webview is created when you first open it and closed again after 10 minutes hidden. On Windows, the YouTube Music webview is told to trim its memory while the window is hidden.
 - **Private by design.** Zero analytics, zero telemetry, zero crash-reporting. No backend, no account system, no OAuth. The app only ever contacts **YouTube/Google** (the music page + album art) and **GitHub** (for updates). All settings stay local.
 - **Least privilege.** The remote YouTube Music origin may only emit events (`core:event:allow-emit`) — no custom commands, no window APIs, no clipboard, no filesystem access. Everything it reports is validated in Rust before it reaches the mini-player.
 
@@ -60,7 +60,7 @@ cd src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings &
 
 ## Auto-update
 
-Release builds check `latest.json` on GitHub Releases 15 seconds after launch and then every 6 hours. When a newer version exists, Flit downloads it in the background and verifies its [minisign](https://jedisct1.github.io/minisign/) signature against the public key in `tauri.conf.json`. It then shows **Restart to update** in the mini-player, plus a notice in the YouTube Music window. Nothing is installed until you click it. You can also check manually under the mini-player's settings. Development builds never check automatically.
+Release builds check `latest.json` on GitHub Releases 15 seconds after launch and then every 6 hours. When a newer version exists, the mini-player shows **Update to X**, plus a notice in the YouTube Music window. Clicking it downloads the update, verifies its [minisign](https://jedisct1.github.io/minisign/) signature against the public key in `tauri.conf.json`, installs it and restarts Flit. Nothing is downloaded or installed until you click; installers can be large (a Linux AppImage is around 100 MB), so Flit doesn't keep one in memory in the meantime. You can also check manually under the mini-player's settings. Development builds never check automatically.
 
 On Linux, in-place updates work for the AppImage and .deb/.rpm bundles; other installs should update through their package source.
 

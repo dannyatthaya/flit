@@ -3,6 +3,8 @@
 **Mark:** Soundwave · **Theme:** Ink + Mint
 **Colors:** Tile `#15171A` · Wave `#2EE6A0`
 
+Source artwork only. Nothing here is bundled into the app: everything in `static/` is embedded in the binary, so keep this folder out of it. The app icons Tauri uses live in `src-tauri/icons/`.
+
 ## Contents
 
 ```
